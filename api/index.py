@@ -9,9 +9,9 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 
-# -----------------------------
+
 # Setup
-# -----------------------------
+
 load_dotenv()
 
 api_key = os.getenv("OPENAI_API_KEY")
