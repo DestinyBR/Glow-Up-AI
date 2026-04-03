@@ -2,13 +2,11 @@ import base64
 import io
 import json
 import os
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from openai import OpenAI
 
 # -----------------------------
@@ -32,13 +30,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-
-PROFILE_PATH = DATA_DIR / "profile.json"
-OUTFITS_PATH = DATA_DIR / "saved_outfits.json"
-
+# -----------------------------
+# System prompt
+# -----------------------------
 SYSTEM_PROMPT = """
 You are Glow Up Bot, a warm, stylish, inclusive beauty and fashion assistant.
 
@@ -66,6 +60,13 @@ Rules:
 - keep answers practical
 """
 
+# -----------------------------
+# Profile helpers
+# NOTE: Vercel is stateless — profile is passed in from the frontend
+# on every request and returned back. The Next.js frontend stores it
+# in localStorage or a database. No file system is used here.
+# -----------------------------
+
 DEFAULT_PROFILE = {
     "name": "",
     "favorite_colors": [],
@@ -79,7 +80,7 @@ DEFAULT_PROFILE = {
     "notes": [],
 }
 
-DEFAULT_OUTFIT_GAME = {
+DEFAULT_OUTFIT = {
     "occasion": "",
     "vibe": "",
     "top": "",
@@ -92,24 +93,6 @@ DEFAULT_OUTFIT_GAME = {
     "colors": "",
     "notes": "",
 }
-
-
-# -----------------------------
-# Persistence helpers
-# -----------------------------
-def load_json(path: Path, fallback: Any) -> Any:
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return fallback
-    return fallback
-
-
-def save_json(path: Path, data: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
 
 
 def safe_list(value: Any) -> List[str]:
@@ -150,35 +133,34 @@ def to_data_url(file_bytes: bytes, mime: str) -> str:
 
 
 # -----------------------------
-# Data access
-# -----------------------------
-def get_profile() -> Dict[str, Any]:
-    saved_profile = load_json(PROFILE_PATH, DEFAULT_PROFILE.copy())
-    merged = DEFAULT_PROFILE.copy()
-    merged.update(saved_profile)
-    return merged
-
-
-def set_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
-    merged = DEFAULT_PROFILE.copy()
-    merged.update(profile)
-    save_json(PROFILE_PATH, merged)
-    return merged
-
-
-def get_saved_outfits() -> List[Dict[str, Any]]:
-    return load_json(OUTFITS_PATH, [])
-
-
-def set_saved_outfits(outfits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    save_json(OUTFITS_PATH, outfits)
-    return outfits
-
-
-# -----------------------------
 # OpenAI helpers
 # -----------------------------
-def extract_profile_updates(conversation_text: str, current_profile: Dict[str, Any]) -> Dict[str, Any]:
+
+def ask_glowup_bot(
+    user_text: str,
+    profile: Dict[str, Any],
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Send a chat message and return the assistant reply."""
+    system_message = {
+        "role": "system",
+        "content": SYSTEM_PROMPT + "\n\nSaved profile: " + profile_summary(profile),
+    }
+
+    history = messages[-12:] if messages else []
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[system_message] + history + [{"role": "user", "content": user_text}],
+    )
+    return response.choices[0].message.content
+
+
+def extract_profile_updates(
+    conversation_text: str,
+    current_profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Use GPT to pull stable beauty preferences out of conversation text."""
     schema = {
         "type": "object",
         "properties": {
@@ -193,43 +175,32 @@ def extract_profile_updates(conversation_text: str, current_profile: Dict[str, A
             "notes": {"type": "array", "items": {"type": "string"}},
         },
         "required": [
-            "favorite_colors",
-            "favorite_styles",
-            "best_colors",
-            "skin_tone",
-            "undertone",
-            "face_shape",
-            "hair_texture",
-            "budget",
-            "notes",
+            "favorite_colors", "favorite_styles", "best_colors",
+            "skin_tone", "undertone", "face_shape",
+            "hair_texture", "budget", "notes",
         ],
         "additionalProperties": False,
     }
 
     try:
-        response = client.responses.create(
-            model="gpt-5",
-            input=[
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
                 {
                     "role": "system",
                     "content": (
                         "Extract only stable beauty/style preferences from the text. "
-                        "Do not invent facts. Return empty strings/lists when unknown."
+                        "Do not invent facts. Return empty strings/lists when unknown. "
+                        "Respond ONLY with valid JSON matching the schema — no markdown, no extra text."
                     ),
                 },
                 {"role": "user", "content": conversation_text},
             ],
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "profile_update",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
+            response_format={"type": "json_object"},
         )
 
-        data = json.loads(response.output_text)
+        raw = response.choices[0].message.content
+        data = json.loads(raw)
 
         updated = current_profile.copy()
         updated["favorite_colors"] = merge_unique(
@@ -248,185 +219,105 @@ def extract_profile_updates(conversation_text: str, current_profile: Dict[str, A
             safe_list(updated.get("notes", [])),
             safe_list(data.get("notes", [])),
         )
-
         for key in ["skin_tone", "undertone", "face_shape", "hair_texture", "budget"]:
             val = str(data.get(key, "")).strip()
             if val:
                 updated[key] = val
 
-        save_json(PROFILE_PATH, updated)
         return updated
+
     except Exception:
         return current_profile
 
 
-def build_model_messages(user_text: str, profile: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    prompt_messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT + "\n\nSaved profile: " + profile_summary(profile),
-        }
-    ]
-    if messages:
-        prompt_messages.extend(messages[-12:])
-    prompt_messages.append({"role": "user", "content": user_text})
-    return prompt_messages
+def analyze_face_photo(
+    image_bytes: bytes,
+    mime: str,
+    extra_context: str = "",
+) -> Dict[str, Any]:
+    """Analyze a selfie and return structured beauty guidance."""
+    data_url = to_data_url(image_bytes, mime)
 
+    prompt = f"""
+Analyze this selfie for beauty guidance. Return ONLY valid JSON — no markdown, no extra text.
 
-def ask_glowup_bot(user_text: str, profile: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> str:
-    response = client.responses.create(
-        model="gpt-5",
-        input=build_model_messages(user_text, profile, messages),
-        truncation="auto",
+Respond with this exact structure:
+{{
+  "face_shape": "...",
+  "skin_tone": "...",
+  "undertone": "...",
+  "confidence_note": "...",
+  "blush_placement": "...",
+  "contour_bronzer": "...",
+  "lip_shades": ["...", "..."],
+  "brow_direction": "...",
+  "hairstyle_directions": ["...", "...", "..."],
+  "makeup_look": "...",
+  "notes": ["..."]
+}}
+
+Be cautious. Do not claim certainty. Note in confidence_note if lighting, angle, or image quality reduces confidence.
+
+Extra context from user: {extra_context}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_url, "detail": "high"},
+                    },
+                ],
+            }
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=1000,
     )
-    return response.output_text
+
+    return json.loads(response.choices[0].message.content)
+
+
+def apply_face_analysis_to_profile(
+    analysis: Dict[str, Any],
+    current_profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    updated = current_profile.copy()
+    for key in ["face_shape", "skin_tone", "undertone"]:
+        val = str(analysis.get(key, "")).strip()
+        if val:
+            updated[key] = val
+    updated["notes"] = merge_unique(
+        safe_list(updated.get("notes", [])),
+        safe_list(analysis.get("notes", [])),
+    )
+    return updated
+
+
+def generate_outfit_image(prompt: str) -> str:
+    """Generate an outfit image and return base64 string."""
+    response = client.images.generate(
+        model="dall-e-3",
+        prompt=prompt,
+        n=1,
+        size="1024x1024",
+        response_format="b64_json",
+    )
+    return response.data[0].b64_json
 
 
 def transcribe_audio(audio_bytes: bytes) -> str:
     audio_file = io.BytesIO(audio_bytes)
     audio_file.name = "voice_question.wav"
     transcript = client.audio.transcriptions.create(
-        model="gpt-4o-transcribe",
+        model="whisper-1",
         file=audio_file,
     )
-    return getattr(transcript, "text", "").strip()
-
-
-def analyze_face_photo_structured(image_bytes: bytes, mime: str, extra_context: str = "") -> Dict[str, Any]:
-    data_url = to_data_url(image_bytes, mime)
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "face_shape": {"type": "string"},
-            "skin_tone": {"type": "string"},
-            "undertone": {"type": "string"},
-            "confidence_note": {"type": "string"},
-            "blush_placement": {"type": "string"},
-            "contour_bronzer": {"type": "string"},
-            "lip_shades": {"type": "array", "items": {"type": "string"}},
-            "brow_direction": {"type": "string"},
-            "hairstyle_directions": {"type": "array", "items": {"type": "string"}},
-            "makeup_look": {"type": "string"},
-            "notes": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": [
-            "face_shape",
-            "skin_tone",
-            "undertone",
-            "confidence_note",
-            "blush_placement",
-            "contour_bronzer",
-            "lip_shades",
-            "brow_direction",
-            "hairstyle_directions",
-            "makeup_look",
-            "notes",
-        ],
-        "additionalProperties": False,
-    }
-
-    prompt = f"""
-Analyze this selfie for beauty guidance.
-
-Return your best estimate for:
-- likely face shape
-- visible skin tone
-- likely undertone
-
-Be cautious.
-Do not claim certainty.
-If lighting, angle, makeup, or image quality reduces confidence, say so in confidence_note.
-
-Also provide:
-- flattering blush placement
-- contour/bronzer strategy
-- lip shades
-- brow direction
-- 3 hairstyle directions
-- 1 makeup look that would flatter the face
-
-Extra context from the user:
-{extra_context}
-"""
-
-    response = client.responses.create(
-        model="gpt-5",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url, "detail": "high"},
-                ],
-            }
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "face_analysis",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-        truncation="auto",
-    )
-
-    return json.loads(response.output_text)
-
-
-def apply_face_analysis_to_profile(analysis_data: Dict[str, Any], current_profile: Dict[str, Any]) -> Dict[str, Any]:
-    updated = current_profile.copy()
-
-    face_shape = str(analysis_data.get("face_shape", "")).strip()
-    skin_tone = str(analysis_data.get("skin_tone", "")).strip()
-    undertone = str(analysis_data.get("undertone", "")).strip()
-    notes = safe_list(analysis_data.get("notes", []))
-
-    if face_shape:
-        updated["face_shape"] = face_shape
-    if skin_tone:
-        updated["skin_tone"] = skin_tone
-    if undertone:
-        updated["undertone"] = undertone
-
-    updated["notes"] = merge_unique(
-        safe_list(updated.get("notes", [])),
-        notes
-    )
-
-    save_json(PROFILE_PATH, updated)
-    return updated
-
-
-def generate_outfit_image(prompt: str) -> Optional[str]:
-    response = client.responses.create(
-        model="gpt-5",
-        input=prompt,
-        tools=[{"type": "image_generation"}],
-        tool_choice={"type": "image_generation"},
-    )
-
-    if hasattr(response, "output"):
-        for item in response.output:
-            item_type = getattr(item, "type", "")
-            if item_type == "image_generation_call":
-                result = getattr(item, "result", None)
-                if isinstance(result, str):
-                    return result
-
-                if isinstance(result, list):
-                    for piece in result:
-                        b64_data = getattr(piece, "b64_json", None) or getattr(piece, "image_base64", None)
-                        if b64_data:
-                            return b64_data
-
-            if hasattr(item, "result"):
-                result = getattr(item, "result")
-                if isinstance(result, str):
-                    return result
-
-    return None
+    return transcript.text.strip()
 
 
 def outfit_feedback_prompt(game: Dict[str, str], profile: Dict[str, Any]) -> str:
@@ -460,64 +351,28 @@ Please:
 # -----------------------------
 # Routes
 # -----------------------------
+
 @app.get("/")
 def root():
     return {"message": "Glow Up Bot API is running"}
 
 
-@app.get("/profile")
-def read_profile():
-    return get_profile()
-
-
-@app.post("/profile")
-async def update_profile(payload: Dict[str, Any]):
-    current = get_profile()
-    current.update(payload)
-    return set_profile(current)
-
-
-@app.post("/profile/extract")
-async def extract_profile(payload: Dict[str, Any]):
-    text = payload.get("text", "")
-    if not text:
-        raise HTTPException(status_code=400, detail="Missing text.")
-    updated = extract_profile_updates(text, get_profile())
-    return updated
-
-
-@app.get("/outfits")
-def read_outfits():
-    return get_saved_outfits()
-
-
-@app.post("/outfits")
-async def save_outfit(payload: Dict[str, Any]):
-    outfits = get_saved_outfits()
-    outfits.insert(0, payload)
-    set_saved_outfits(outfits)
-    return {"success": True, "outfits": outfits}
-
-
-@app.delete("/outfits/{index}")
-def delete_outfit(index: int):
-    outfits = get_saved_outfits()
-    if index < 0 or index >= len(outfits):
-        raise HTTPException(status_code=404, detail="Outfit not found.")
-    deleted = outfits.pop(index)
-    set_saved_outfits(outfits)
-    return {"success": True, "deleted": deleted, "outfits": outfits}
-
-
 @app.post("/chat")
 async def chat(payload: Dict[str, Any]):
+    """
+    Send a chat message.
+    Payload: { message, messages (history), profile }
+    Returns: { reply, profile }
+    """
     user_text = payload.get("message", "").strip()
     messages = payload.get("messages", [])
+    profile = {**DEFAULT_PROFILE, **payload.get("profile", {})}
+
     if not user_text:
         raise HTTPException(status_code=400, detail="Missing message.")
 
-    profile = get_profile()
     reply = ask_glowup_bot(user_text, profile, messages)
+
     updated_profile = extract_profile_updates(
         "\n".join(
             [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages[-8:]]
@@ -526,10 +381,7 @@ async def chat(payload: Dict[str, Any]):
         profile,
     )
 
-    return {
-        "reply": reply,
-        "profile": updated_profile,
-    }
+    return {"reply": reply, "profile": updated_profile}
 
 
 @app.post("/transcribe-audio")
@@ -544,43 +396,75 @@ async def transcribe_audio_route(file: UploadFile = File(...)):
 @app.post("/analyze-face")
 async def analyze_face_route(
     file: UploadFile = File(...),
-    extra_context: str = Form(default="")
+    extra_context: str = Form(default=""),
+    profile: str = Form(default="{}"),
 ):
+    """
+    Analyze a selfie.
+    Form fields: file, extra_context (str), profile (JSON string)
+    Returns: { analysis, profile }
+    """
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty image file.")
 
-    mime = file.content_type or "image/jpeg"
-    analysis = analyze_face_photo_structured(image_bytes, mime, extra_context)
-    updated_profile = apply_face_analysis_to_profile(analysis, get_profile())
+    try:
+        current_profile = {**DEFAULT_PROFILE, **json.loads(profile)}
+    except Exception:
+        current_profile = DEFAULT_PROFILE.copy()
 
-    return {
-        "analysis": analysis,
-        "profile": updated_profile,
-    }
+    mime = file.content_type or "image/jpeg"
+    analysis = analyze_face_photo(image_bytes, mime, extra_context)
+    updated_profile = apply_face_analysis_to_profile(analysis, current_profile)
+
+    return {"analysis": analysis, "profile": updated_profile}
 
 
 @app.post("/generate-image")
 async def generate_image_route(payload: Dict[str, Any]):
+    """
+    Generate an outfit image.
+    Payload: { prompt }
+    Returns: { image_base64 }
+    """
     prompt = payload.get("prompt", "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Missing prompt.")
 
     image_b64 = generate_outfit_image(prompt)
-    if not image_b64:
-        raise HTTPException(status_code=500, detail="No image returned.")
-
-    return {
-        "image_base64": image_b64
-    }
+    return {"image_base64": image_b64}
 
 
 @app.post("/outfit-feedback")
 async def outfit_feedback_route(payload: Dict[str, Any]):
+    """
+    Get AI feedback on a drafted outfit.
+    Payload: { outfit, profile }
+    Returns: { feedback }
+    """
     outfit = payload.get("outfit", {})
+    profile = {**DEFAULT_PROFILE, **payload.get("profile", {})}
+
     if not isinstance(outfit, dict):
         raise HTTPException(status_code=400, detail="Invalid outfit payload.")
 
-    prompt = outfit_feedback_prompt(outfit, get_profile())
-    reply = ask_glowup_bot(prompt, get_profile())
-    return {"feedback": reply}
+    prompt = outfit_feedback_prompt(outfit, profile)
+    feedback = ask_glowup_bot(prompt, profile)
+    return {"feedback": feedback}
+
+
+@app.post("/extract-profile")
+async def extract_profile_route(payload: Dict[str, Any]):
+    """
+    Extract beauty profile from free text.
+    Payload: { text, profile }
+    Returns: updated profile dict
+    """
+    text = payload.get("text", "").strip()
+    profile = {**DEFAULT_PROFILE, **payload.get("profile", {})}
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing text.")
+
+    updated = extract_profile_updates(text, profile)
+    return updated
