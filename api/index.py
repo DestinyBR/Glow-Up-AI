@@ -239,7 +239,8 @@ def analyze_face_photo(
     data_url = to_data_url(image_bytes, mime)
 
     prompt = f"""
-Analyze this selfie for beauty guidance. Return ONLY valid JSON. No markdown, no extra text.
+Analyze ONLY the person visible in this uploaded selfie. Ignore any previous saved profile values. 
+Do not reuse old face shape, skin tone, undertone, or hair texture. Estimate from the current image only. Return ONLY valid JSON. No markdown, no extra text.
 
 Respond with this exact structure:
 {{
