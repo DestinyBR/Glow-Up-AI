@@ -24,7 +24,7 @@ app = FastAPI(title="Glow Up Bot API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://10.253.43.7:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -147,11 +147,11 @@ def ask_glowup_bot(
         "content": SYSTEM_PROMPT + "\n\nSaved profile: " + profile_summary(profile),
     }
 
-    history = messages[-12:] if messages else []
+    history = messages[-12:] if messages else [{"role": "user", "content": user_text}]
 
     response = client.chat.completions.create(
         model="gpt-4o",
-        messages=[system_message] + history + [{"role": "user", "content": user_text}],
+        messages=[system_message] + history,
     )
     return response.choices[0].message.content
 
@@ -239,7 +239,7 @@ def analyze_face_photo(
     data_url = to_data_url(image_bytes, mime)
 
     prompt = f"""
-Analyze this selfie for beauty guidance. Return ONLY valid JSON — no markdown, no extra text.
+Analyze this selfie for beauty guidance. Return ONLY valid JSON. No markdown, no extra text.
 
 Respond with this exact structure:
 {{
@@ -364,24 +364,31 @@ async def chat(payload: Dict[str, Any]):
     Payload: { message, messages (history), profile }
     Returns: { reply, profile }
     """
-    user_text = payload.get("message", "").strip()
-    messages = payload.get("messages", [])
-    profile = {**DEFAULT_PROFILE, **payload.get("profile", {})}
+    try:
+        user_text = payload.get("message", "").strip()
+        messages = payload.get("messages", [])
+        profile = {**DEFAULT_PROFILE, **payload.get("profile", {})}
 
-    if not user_text:
-        raise HTTPException(status_code=400, detail="Missing message.")
+        if not user_text:
+            raise HTTPException(status_code=400, detail="Missing message.")
 
-    reply = ask_glowup_bot(user_text, profile, messages)
+        reply = ask_glowup_bot(user_text, profile, messages)
 
-    updated_profile = extract_profile_updates(
-        "\n".join(
-            [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages[-8:]]
-            + [f"user: {user_text}", f"assistant: {reply}"]
-        ),
-        profile,
-    )
+        updated_profile = extract_profile_updates(
+            "\n".join(
+                [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages[-8:]]
+                + [f"user: {user_text}", f"assistant: {reply}"]
+            ),
+            profile,
+        )
 
-    return {"reply": reply, "profile": updated_profile}
+        return {"reply": reply, "profile": updated_profile}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("CHAT ROUTE ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=f"Backend error: {str(e)}")
 
 
 @app.post("/transcribe-audio")
