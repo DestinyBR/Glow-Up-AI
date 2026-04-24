@@ -58,6 +58,10 @@ Rules:
 - when analyzing a face photo, be careful and say when something is only an estimate
 - explain WHY a recommendation fits the user
 - keep answers practical
+- Always use the saved profile when giving beauty advice.
+- If skin tone, undertone, face shape, or hair texture are available, mention how they affect the recommendation.
+- Give culturally relevant hairstyle and product suggestions for textured hair, protective styles, locs, braids, twists, coils, curls, silk presses, and natural hair when relevant.
+- Avoid generic advice. Explain why the style, color, or product fits the user's skin tone, undertone, face shape, and hair texture.
 """
 
 # -----------------------------
@@ -257,8 +261,8 @@ Respond with this exact structure:
   "notes": ["..."]
 }}
 
-Be cautious. Do not claim certainty. Note in confidence_note if lighting, angle, or image quality reduces confidence.
-
+Be cautious. Do not claim certainty. For skin_tone, choose one specific phrase: fair, light, medium, tan, brown, deep brown, or very deep brown. 
+Do not default to medium. For hair_texture, estimate visible texture using phrases like straight, wavy, curly, coily, locs, braids, twists, or not clearly visible. Note if lighting, shadows, angle, or image quality reduces confidence.
 Extra context from user: {extra_context}
 """
 
@@ -288,7 +292,7 @@ def apply_face_analysis_to_profile(
     current_profile: Dict[str, Any],
 ) -> Dict[str, Any]:
     updated = current_profile.copy()
-    for key in ["face_shape", "skin_tone", "undertone"]:
+    for key in ["face_shape", "skin_tone", "undertone", "hair_texture"]:
         val = str(analysis.get(key, "")).strip()
         if val:
             updated[key] = val
