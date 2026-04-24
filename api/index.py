@@ -58,10 +58,6 @@ Rules:
 - when analyzing a face photo, be careful and say when something is only an estimate
 - explain WHY a recommendation fits the user
 - keep answers practical
-- Always use the saved profile when giving beauty advice.
-- If skin tone, undertone, face shape, or hair texture are available, mention how they affect the recommendation.
-- Give culturally relevant hairstyle and product suggestions for textured hair, protective styles, locs, braids, twists, coils, curls, silk presses, and natural hair when relevant.
-- Avoid generic advice. Explain why the style, color, or product fits the user's skin tone, undertone, face shape, and hair texture.
 """
 
 # -----------------------------
@@ -251,6 +247,7 @@ Respond with this exact structure:
   "face_shape": "...",
   "skin_tone": "...",
   "undertone": "...",
+  "hair_texture": "...",
   "confidence_note": "...",
   "blush_placement": "...",
   "contour_bronzer": "...",
@@ -262,7 +259,10 @@ Respond with this exact structure:
 }}
 
 Be cautious. Do not claim certainty. For skin_tone, choose one specific phrase: fair, light, medium, tan, brown, deep brown, or very deep brown. 
-Do not default to medium. For hair_texture, estimate visible texture using phrases like straight, wavy, curly, coily, locs, braids, twists, or not clearly visible. Note if lighting, shadows, angle, or image quality reduces confidence.
+Do not default to medium. For hair_texture, estimate visible texture using phrases like straight, wavy, curly, coily, locs, braids, twists, or not clearly visible.
+For hair_texture, identify visible hair presentation such as braids, twists, locs, afro, coils, curls, waves, straight hair, silk press, wig, weave, or not clearly visible. 
+If the person has braids, return "braids". If the person has locs, return "locs".
+Note if lighting, shadows, angle, or image quality reduces confidence.
 Extra context from user: {extra_context}
 """
 
