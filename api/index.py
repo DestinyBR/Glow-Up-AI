@@ -300,6 +300,7 @@ def apply_face_analysis_to_profile(
         safe_list(updated.get("notes", [])),
         safe_list(analysis.get("notes", [])),
     )
+    
     return updated
 
 
