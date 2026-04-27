@@ -239,8 +239,17 @@ def analyze_face_photo(
     data_url = to_data_url(image_bytes, mime)
 
     prompt = f"""
-Analyze ONLY the person visible in this uploaded selfie. Ignore any previous saved profile values. 
-Do not reuse old face shape, skin tone, undertone, or hair texture. Estimate from the current image only. Return ONLY valid JSON. No markdown, no extra text.
+Analyze ONLY the person visible in this uploaded selfie.
+
+Prioritize consistency. If lighting, shadows, angle, blur, distance, or hairstyle coverage makes a trait uncertain, do NOT guess a new value. Use "uncertain" for that field.
+
+Only change face_shape, skin_tone, undertone, or hair_texture when the image clearly supports it.
+
+Use these fixed labels only:
+face_shape: oval, round, square, heart, diamond, oblong, uncertain
+skin_tone: fair, light, medium, tan, brown, deep brown, very deep brown, uncertain
+undertone: warm, cool, neutral, olive, uncertain
+hair_texture: straight, wavy, curly, coily, braids, twists, locs, wig, weave, not clearly visible, uncertain
 
 Respond with this exact structure:
 {{
@@ -292,15 +301,20 @@ def apply_face_analysis_to_profile(
     current_profile: Dict[str, Any],
 ) -> Dict[str, Any]:
     updated = current_profile.copy()
-    for key in ["face_shape", "skin_tone", "undertone", "hair_texture"]:
-        val = str(analysis.get(key, "")).strip()
-        if val:
+
+    stable_keys = ["face_shape", "skin_tone", "undertone", "hair_texture"]
+
+    for key in stable_keys:
+        val = str(analysis.get(key, "")).strip().lower()
+
+        if val and val not in ["uncertain", "not clearly visible", "not detected"]:
             updated[key] = val
+
     updated["notes"] = merge_unique(
         safe_list(updated.get("notes", [])),
         safe_list(analysis.get("notes", [])),
     )
-    
+
     return updated
 
 
