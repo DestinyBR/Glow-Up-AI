@@ -64,7 +64,7 @@ Rules:
 # Profile helpers
 # NOTE: Vercel is stateless — profile is passed in from the frontend
 # on every request and returned back. The Next.js frontend stores it
-# in localStorage or a database. No file system is used here.
+# in localStorage. No file system is used here.
 # -----------------------------
 
 DEFAULT_PROFILE = {
@@ -93,6 +93,22 @@ DEFAULT_OUTFIT = {
     "colors": "",
     "notes": "",
 }
+
+# Stable labels the model must use
+FACE_SHAPE_LABELS = ["oval", "round", "square", "heart", "diamond", "oblong", "uncertain"]
+SKIN_TONE_LABELS = ["fair", "light", "medium", "tan", "brown", "deep brown", "very deep brown", "uncertain"]
+UNDERTONE_LABELS = ["warm", "cool", "neutral", "olive", "uncertain"]
+
+# Hair texture labels — protective styles are first-class labels
+HAIR_TEXTURE_LABELS = [
+    "straight", "wavy", "curly", "coily", "afro",
+    "braids", "box braids", "knotless braids", "cornrows", "micro braids",
+    "twists", "two-strand twists", "locs", "sisterlocs", "faux locs",
+    "silk press", "wig", "weave", "bantu knots",
+    "not clearly visible", "uncertain"
+]
+
+UNCERTAIN_VALUES = {"uncertain", "not clearly visible", "not detected", ""}
 
 
 def safe_list(value: Any) -> List[str]:
@@ -130,6 +146,118 @@ def profile_summary(profile: Dict[str, Any]) -> str:
 
 def to_data_url(file_bytes: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(file_bytes).decode('utf-8')}"
+
+
+# -----------------------------
+# Stabilization helpers
+# -----------------------------
+
+def majority_vote(values: List[str]) -> Optional[str]:
+    """Return the most common non-uncertain value from a list, or None."""
+    filtered = [v.strip().lower() for v in values if v.strip().lower() not in UNCERTAIN_VALUES]
+    if not filtered:
+        return None
+    counts: Dict[str, int] = {}
+    for v in filtered:
+        counts[v] = counts.get(v, 0) + 1
+    best = max(counts, key=lambda k: counts[k])
+    # Require at least 2 votes out of 3 to be considered stable
+    if counts[best] >= 2:
+        return best
+    return None
+
+
+def stabilize_analyses(analyses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Given up to 3 recent analysis results, return a stabilized consensus.
+    Only fields where at least 2/3 analyses agree get a non-uncertain value.
+    """
+    if not analyses:
+        return {}
+
+    stable_fields = ["face_shape", "skin_tone", "undertone", "hair_texture"]
+    result: Dict[str, Any] = {}
+
+    for field in stable_fields:
+        values = [str(a.get(field, "")).strip().lower() for a in analyses]
+        winner = majority_vote(values)
+        result[field] = winner if winner else "uncertain"
+
+    # For list fields, merge across all analyses
+    all_hairstyle_dirs: List[str] = []
+    all_lip_shades: List[str] = []
+    all_notes: List[str] = []
+
+    for a in analyses:
+        all_hairstyle_dirs.extend(safe_list(a.get("hairstyle_directions", [])))
+        all_lip_shades.extend(safe_list(a.get("lip_shades", [])))
+        all_notes.extend(safe_list(a.get("notes", [])))
+
+    # Use the most recent analysis for cosmetic suggestions
+    latest = analyses[-1]
+    result["blush_placement"] = latest.get("blush_placement", "")
+    result["contour_bronzer"] = latest.get("contour_bronzer", "")
+    result["brow_direction"] = latest.get("brow_direction", "")
+    result["makeup_look"] = latest.get("makeup_look", "")
+
+    # De-duplicate list fields
+    result["hairstyle_directions"] = list(dict.fromkeys(all_hairstyle_dirs))[:5]
+    result["lip_shades"] = list(dict.fromkeys(all_lip_shades))[:4]
+    result["notes"] = list(dict.fromkeys(all_notes))[:5]
+
+    # Confidence score: fraction of stable fields that are not uncertain
+    n_stable = sum(1 for f in stable_fields if result.get(f, "uncertain") != "uncertain")
+    result["confidence_score"] = n_stable / len(stable_fields)
+    result["confidence_note"] = _build_confidence_note(result, len(analyses))
+
+    return result
+
+
+def _build_confidence_note(result: Dict[str, Any], n_analyses: int) -> str:
+    score = result.get("confidence_score", 0)
+    if score >= 0.75:
+        return f"High confidence — {n_analyses} photo(s) analyzed with consistent results."
+    elif score >= 0.5:
+        return f"Medium confidence — some features detected consistently across {n_analyses} photo(s). Try better lighting for remaining fields."
+    else:
+        return f"Low confidence across {n_analyses} photo(s). For best results: face the camera directly, use bright even lighting, and keep your face uncovered."
+
+
+def apply_stabilized_to_profile(
+    stabilized: Dict[str, Any],
+    current_profile: Dict[str, Any],
+    force_update: bool = False,
+) -> Dict[str, Any]:
+    """
+    Update profile with stabilized results.
+    Only overwrite a field if:
+      - The new value is not uncertain, AND
+      - The profile field is currently empty OR force_update is True
+    This prevents a single low-quality photo from overwriting good saved data.
+    """
+    updated = current_profile.copy()
+    stable_fields = ["face_shape", "skin_tone", "undertone", "hair_texture"]
+
+    for key in stable_fields:
+        new_val = str(stabilized.get(key, "")).strip().lower()
+        current_val = str(updated.get(key, "")).strip().lower()
+
+        if new_val in UNCERTAIN_VALUES:
+            continue  # Never overwrite with uncertain
+
+        if not current_val or force_update:
+            updated[key] = new_val
+        elif new_val != current_val:
+            # Only update if confidence is high enough to override
+            if stabilized.get("confidence_score", 0) >= 0.75:
+                updated[key] = new_val
+
+    updated["notes"] = merge_unique(
+        safe_list(updated.get("notes", [])),
+        safe_list(stabilized.get("notes", [])),
+    )
+
+    return updated
 
 
 # -----------------------------
@@ -234,50 +362,90 @@ def analyze_face_photo(
     image_bytes: bytes,
     mime: str,
     extra_context: str = "",
+    existing_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Analyze a selfie and return structured beauty guidance."""
+    """
+    Analyze a selfie and return structured beauty guidance.
+    Improved prompting for protective styles and consistency.
+    """
     data_url = to_data_url(image_bytes, mime)
 
+    profile_hint = ""
+    if existing_profile:
+        saved_hair = existing_profile.get("hair_texture", "")
+        if saved_hair and saved_hair.lower() not in UNCERTAIN_VALUES:
+            profile_hint = f"\nNote: The user's previously saved hair texture is '{saved_hair}'. Only change this if you can clearly see something different."
+
+    hair_labels = ", ".join(HAIR_TEXTURE_LABELS)
+    face_labels = ", ".join(FACE_SHAPE_LABELS)
+    skin_labels = ", ".join(SKIN_TONE_LABELS)
+    undertone_labels = ", ".join(UNDERTONE_LABELS)
+
     prompt = f"""
-Analyze ONLY the person visible in this uploaded selfie.
+You are analyzing a selfie for a beauty app. Be precise, honest, and use ONLY the allowed labels.
 
-Prioritize consistency. If lighting, shadows, angle, blur, distance, or hairstyle coverage makes a trait uncertain, do NOT guess a new value. Use "uncertain" for that field.
+=== ALLOWED LABELS ===
+face_shape: {face_labels}
+skin_tone: {skin_labels}
+undertone: {undertone_labels}
+hair_texture: {hair_labels}
 
-Only change face_shape, skin_tone, undertone, or hair_texture when the image clearly supports it.
+=== HAIR TEXTURE DETECTION — CRITICAL ===
+This is the most important field. Read carefully:
 
-Use these fixed labels only:
-face_shape: oval, round, square, heart, diamond, oblong, uncertain
-skin_tone: fair, light, medium, tan, brown, deep brown, very deep brown, uncertain
-undertone: warm, cool, neutral, olive, uncertain
-hair_texture: straight, wavy, curly, coily, braids, twists, locs, wig, weave, not clearly visible, uncertain
+1. LOOK FIRST at the hair before classifying. Ask: Are there individual rope-like strands that could be locs? Are strands woven/plaited into braids? Are there defined coil or curl patterns?
+2. PROTECTIVE STYLES override texture-based labels:
+   - If you see LOCS (rope-like fused strands, any length): return "locs"
+   - If you see BRAIDS of any kind (box braids, cornrows, knotless, micro): return "braids"  
+   - If you see TWISTS (two-strand twisted sections): return "twists"
+   - If you see a WIG or WEAVE that is clearly added hair: return "wig" or "weave"
+3. Only use "straight", "wavy", "curly", "coily", "afro" for NATURAL unprotected hair
+4. If you genuinely cannot see the hair (covered, off-frame, very blurry): return "not clearly visible"
+5. NEVER return "uncertain" for hair if you can see it at all — commit to your best label
 
-Respond with this exact structure:
+=== FACE ANALYSIS ===
+- Look for the overall face perimeter shape, not just features
+- If the face is partially covered, angled, or shadowed: return "uncertain"
+- Do NOT default to "oval" — only return oval if it's clearly oval
+
+=== SKIN TONE ===
+- Use visible skin on the face (forehead, cheeks, jawline)
+- Adjust for lighting: bright lighting can wash out skin, dim lighting can deepen it
+- Do NOT default to "medium" when uncertain — return "uncertain"
+- Choose from: fair, light, medium, tan, brown, deep brown, very deep brown, uncertain
+
+=== CONSISTENCY RULE ===
+Only report what you can clearly see. If uncertain, say "uncertain". Do not guess to fill in a field.
+{profile_hint}
+
+=== OUTPUT FORMAT ===
+Respond with ONLY this JSON object, no extra text:
 {{
-  "face_shape": "...",
-  "skin_tone": "...",
-  "undertone": "...",
-  "hair_texture": "...",
-  "confidence_note": "...",
-  "blush_placement": "...",
-  "contour_bronzer": "...",
-  "lip_shades": ["...", "..."],
-  "brow_direction": "...",
-  "hairstyle_directions": ["...", "...", "..."],
-  "makeup_look": "...",
-  "notes": ["..."]
+  "face_shape": "one label from the allowed list",
+  "skin_tone": "one label from the allowed list",
+  "undertone": "one label from the allowed list",
+  "hair_texture": "one label from the allowed list",
+  "confidence_note": "brief note on image quality and what affected confidence",
+  "confidence_score": 0.0 to 1.0 as a number,
+  "blush_placement": "short description",
+  "contour_bronzer": "short description",
+  "lip_shades": ["shade 1", "shade 2"],
+  "brow_direction": "short description",
+  "hairstyle_directions": ["direction 1", "direction 2", "direction 3"],
+  "makeup_look": "short description",
+  "notes": ["any important observation"]
 }}
 
-Be cautious. Do not claim certainty. For skin_tone, choose one specific phrase: fair, light, medium, tan, brown, deep brown, or very deep brown. 
-Do not default to medium. For hair_texture, estimate visible texture using phrases like straight, wavy, curly, coily, locs, braids, twists, or not clearly visible.
-For hair_texture, identify visible hair presentation such as braids, twists, locs, afro, coils, curls, waves, straight hair, silk press, wig, weave, or not clearly visible. 
-If the person has braids, return "braids". If the person has locs, return "locs".
-Note if lighting, shadows, angle, or image quality reduces confidence.
 Extra context from user: {extra_context}
 """
 
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
+            {
+                "role": "system",
+                "content": "You are a precise beauty analysis assistant. Always respond with a valid JSON object exactly matching the requested schema."
+            },
             {
                 "role": "user",
                 "content": [
@@ -290,24 +458,40 @@ Extra context from user: {extra_context}
             }
         ],
         response_format={"type": "json_object"},
-        max_tokens=1000,
+        max_tokens=1200,
     )
 
-    return json.loads(response.choices[0].message.content)
+    raw = response.choices[0].message.content
+    result = json.loads(raw)
+
+    # Normalize all label fields to lowercase
+    for field in ["face_shape", "skin_tone", "undertone", "hair_texture"]:
+        if field in result:
+            result[field] = str(result[field]).strip().lower()
+
+    # Ensure confidence_score is a float
+    try:
+        result["confidence_score"] = float(result.get("confidence_score", 0.5))
+    except (TypeError, ValueError):
+        result["confidence_score"] = 0.5
+
+    return result
 
 
 def apply_face_analysis_to_profile(
     analysis: Dict[str, Any],
     current_profile: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Legacy single-analysis profile update.
+    Only updates fields that are non-uncertain.
+    """
     updated = current_profile.copy()
-
     stable_keys = ["face_shape", "skin_tone", "undertone", "hair_texture"]
 
     for key in stable_keys:
         val = str(analysis.get(key, "")).strip().lower()
-
-        if val and val not in ["uncertain", "not clearly visible", "not detected"]:
+        if val and val not in UNCERTAIN_VALUES:
             updated[key] = val
 
     updated["notes"] = merge_unique(
@@ -425,11 +609,20 @@ async def analyze_face_route(
     file: UploadFile = File(...),
     extra_context: str = Form(default=""),
     profile: str = Form(default="{}"),
+    analysis_history: str = Form(default="[]"),
+    force_update: str = Form(default="false"),
 ):
     """
-    Analyze a selfie.
-    Form fields: file, extra_context (str), profile (JSON string)
-    Returns: { analysis, profile }
+    Analyze a selfie with consistency/stabilization logic.
+
+    Form fields:
+      file            — image file
+      extra_context   — string of extra context from the user
+      profile         — JSON string of current profile
+      analysis_history — JSON string of last 0-2 previous raw analyses
+      force_update    — "true" to force profile update regardless of confidence
+
+    Returns: { analysis, stabilized, profile, should_update_profile }
     """
     image_bytes = await file.read()
     if not image_bytes:
@@ -440,11 +633,51 @@ async def analyze_face_route(
     except Exception:
         current_profile = DEFAULT_PROFILE.copy()
 
-    mime = file.content_type or "image/jpeg"
-    analysis = analyze_face_photo(image_bytes, mime, extra_context)
-    updated_profile = apply_face_analysis_to_profile(analysis, current_profile)
+    try:
+        history: List[Dict[str, Any]] = json.loads(analysis_history)
+        if not isinstance(history, list):
+            history = []
+    except Exception:
+        history = []
 
-    return {"analysis": analysis, "profile": updated_profile}
+    do_force_update = str(force_update).lower() == "true"
+
+    mime = file.content_type or "image/jpeg"
+
+    # Run the analysis
+    analysis = analyze_face_photo(image_bytes, mime, extra_context, current_profile)
+
+    # Add this analysis to history and keep last 3
+    updated_history = (history + [analysis])[-3:]
+
+    # Stabilize across all analyses in history
+    stabilized = stabilize_analyses(updated_history)
+
+    # Decide whether to update profile
+    # Update if: high confidence OR force_update OR profile fields are still empty
+    profile_fields_empty = all(
+        not str(current_profile.get(f, "")).strip()
+        for f in ["face_shape", "skin_tone", "undertone", "hair_texture"]
+    )
+
+    should_update = (
+        do_force_update
+        or profile_fields_empty
+        or stabilized.get("confidence_score", 0) >= 0.6
+    )
+
+    if should_update:
+        updated_profile = apply_stabilized_to_profile(stabilized, current_profile, force_update=do_force_update)
+    else:
+        updated_profile = current_profile
+
+    return {
+        "analysis": analysis,           # Raw single-photo result
+        "stabilized": stabilized,       # Consensus across history
+        "profile": updated_profile,     # Updated profile (or unchanged)
+        "analysis_history": updated_history,  # Updated history for frontend to store
+        "should_update_profile": should_update,
+    }
 
 
 @app.post("/generate-image")
