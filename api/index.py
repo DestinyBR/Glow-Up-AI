@@ -666,11 +666,36 @@ async def analyze_face_route(
         or stabilized.get("confidence_score", 0) >= 0.6
     )
 
-    if should_update:
-        updated_profile = apply_stabilized_to_profile(stabilized, current_profile, force_update=do_force_update)
-    else:
-        updated_profile = current_profile
+    def apply_face_analysis_to_profile(
+        analysis: Dict[str, Any],
+        current_profile: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        updated = current_profile.copy()
 
+        for key in ["face_shape", "skin_tone", "undertone", "hair_texture"]:
+            new_val = str(analysis.get(key, "")).strip().lower()
+            if new_val and new_val not in UNCERTAIN_VALUES:
+                updated[key] = new_val
+
+        updated["notes"] = merge_unique(
+            safe_list(updated.get("notes", [])),
+            safe_list(analysis.get("notes", [])),
+        )
+
+        return updated
+    # First apply raw single-photo analysis so every completed photo can fill the profile.
+    updated_profile = apply_face_analysis_to_profile(analysis, current_profile)
+
+    # Then apply stabilized results only where they are stronger.
+    # This keeps the profile filled while still improving consistency across 3 photos.
+    if should_update:
+        updated_profile = apply_stabilized_to_profile(
+            stabilized,
+            updated_profile,
+            force_update=True
+        )
+
+    
     return {
         "analysis": analysis,           # Raw single-photo result
         "stabilized": stabilized,       # Consensus across history
